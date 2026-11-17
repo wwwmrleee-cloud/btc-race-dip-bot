@@ -46,7 +46,14 @@ const STOP_DEN = 1000n;
 const MAX_SLIPPAGE_BPS = 300;
 
 const closes: bigint[] = [];
-let entered = false;
+// entered is NOT set when a buy order is sent: an order can be
+// rejected (e.g. a 1-minute gap wider than the 300 bps slippage
+// cap), and a rejected buy must be retried, not treated as a trade.
+// Re-entry is blocked only after a position was actually held
+// (hasTraded, seen in state.positions) or after a stop-out
+// (stoppedOut, set when the stop sell is sent).
+let hasTraded = false;
+let stoppedOut = false;
 let entryClose: bigint | null = null;
 
 function sma240(): bigint | null {
@@ -58,22 +65,29 @@ function sma240(): bigint | null {
 
 await runBars({
   onBatch(state: BarsState, batch): OrderInput[] {
-    if (state.warmingUp) return [];
     const close = state.close(SYMBOL);
     if (close === null) return [];
+    // Record every bar, warmup included: warmup batches exist to
+    // build history from (their orders are rejected, but their closes
+    // are real bars). Returning early here used to drop them, which
+    // delayed the 240-bar average by the warmup length.
     closes.push(close);
+    if (state.warmingUp) return [];
 
     const held = state.positions.get(SYMBOL);
     if (held !== undefined) {
+      hasTraded = true;
       // In a position: hold to the end, except the hard stop.
       if (entryClose !== null && close * STOP_DEN < entryClose * STOP_NUM) {
+        stoppedOut = true;
         return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
-    // Flat: at most one entry ever.
-    if (entered) return [];
+    // Flat: at most one filled entry ever (a rejected buy does not
+    // count, so the next batch retries it).
+    if (hasTraded || stoppedOut) return [];
     const sma = sma240();
     let buy = false;
     if (sma !== null && close * DIP_DEN < sma * DIP_NUM) buy = true;
@@ -81,7 +95,6 @@ await runBars({
     else if (batch.seq >= FALLBACK_ANY_BAR) buy = true;
     if (!buy) return [];
     if (state.cash <= 0n) return [];
-    entered = true;
     entryClose = close;
     let amount = state.cash;
     const room = state.weightRoom(SYMBOL);
